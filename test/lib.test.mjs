@@ -9,6 +9,11 @@ import {
   ICATW_UPSTREAM, ICATW_KEYS,
 } from '../src/lib/config.js'
 
+import {
+  b64enc, normPath, parentOf, shellQuote, shellWriteCmds,
+  mergeCfgText, pickCfg, saveVerdict,
+} from '../src/lib/persist.js'
+
 let pass = 0, fail = 0
 function check(name, ok, got) {
   if (ok) { pass++; console.log('  ok   ' + name) }
@@ -291,6 +296,55 @@ check('sourceName 未知回退 id', sourceName('xxx') === 'xxx')
   for (const id of ['yuki', 'icatw', 'lolicon']) {
     check(id + ' 没有说明文案', !getSource(id).notice)
   }
+}
+
+// ===== 落盘纯函数（persist.js）=====
+{
+  // base64 必须自己算（QuickJS 没有保证有 btoa），中文/emoji 都要能正确往返
+  const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64')
+  for (const s of ['', 'abc', '随机图片', '{"a":1}', 'emoji 🎨 ok', 'a'.repeat(5000)]) {
+    check('b64enc 与标准实现一致 len=' + s.length, b64enc(s) === b64(s), b64enc(s).slice(0, 20))
+  }
+
+  // 分段：每段必须是 4 的倍数，拼回去要等于整段
+  const body = 'x'.repeat(9000)
+  const cmds = shellWriteCmds('/userdisk/a.json', body, 6000)
+  const parts = cmds.map((c) => (/printf '%s' '([^']*)'/.exec(c) || [])[1] || '')
+  check('分段数量正确', parts.length === Math.ceil(b64(body).length / 6000), parts.length)
+  check('每段长度是 4 的倍数', parts.every((p) => p.length % 4 === 0), parts.map((p) => p.length))
+  check('首段覆盖写、后续追加', cmds[0].indexOf(' > ') > 0 && cmds[1].indexOf(' >> ') > 0)
+  check('b64 拼接还原内容', Buffer.from(parts.join(''), 'base64').toString('utf8') === body)
+
+  check('空内容走 : > 截断', shellWriteCmds('/tmp/a', '', 6000)[0] === ": > '/tmp/a'")
+  check('路径含单引号要转义', shellQuote("a'b").indexOf("'\\''") > 0)
+
+  // 路径归一化：$dataDir 见过双斜杠
+  check('normPath 合并双斜杠', normPath('/a//b//c/') === '/a/b/c')
+  check('normPath 保留根', normPath('/') === '/')
+  check('parentOf 正常', parentOf('/a/b/c.json') === '/a/b')
+  check('parentOf 一层', parentOf('/a') === '/')
+
+  // 配置合并：关键 bug —— 读失败不能把整份配置清空
+  const old = '{"cfg_yuki":{"proxy":"i.pixiv.re"},"save_dir":"favorite"}'
+  const merged = mergeCfgText(old, 'cfg_icatw', { source: '' })
+  const mo = JSON.parse(merged)
+  check('合并保留原有键', mo.cfg_yuki && mo.cfg_yuki.proxy === 'i.pixiv.re')
+  check('合并保留 save_dir', mo.save_dir === 'favorite')
+  check('合并写入新键', !!mo.cfg_icatw)
+
+  // 坏文件（旧版本写了一半）不能让合并崩掉，仍要产出合法 JSON
+  const bad = mergeCfgText('{"cfg_yuki":', 'save_dir', 'picture')
+  check('坏 JSON 仍产出合法结果', (() => { try { JSON.parse(bad); return true } catch (e) { return false } })())
+  check('坏 JSON 后仍写入新键', JSON.parse(bad).save_dir === 'picture')
+
+  check('pickCfg 取到值', pickCfg(old, 'save_dir').value === 'favorite')
+  check('pickCfg 缺键返回 found=false', pickCfg(old, 'nope').found === false)
+  check('pickCfg 坏 JSON 不抛', pickCfg('{oops', 'a').found === false)
+
+  // 保存判据：文件写成功才算真的成功
+  check('文件成功即成功', saveVerdict(true, false).ok === true)
+  check('只有镜像不算文件成功', saveVerdict(false, true).why === '仅镜像')
+  check('都失败要报失败', saveVerdict(false, false).ok === false)
 }
 
 console.log('\n%d 通过, %d 失败', pass, fail)

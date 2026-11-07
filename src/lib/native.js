@@ -1,10 +1,164 @@
 // 平台能力桥接（唯一的平台依赖层，页面只调这里）
-// 封装：storage 读写（jsapi + fs 兜底）、curl 发请求、文件读写、输入法
+// 封装：写通道探测、storage 读写（jsapi 镜像 + fs/shell 落盘）、curl 发请求、输入法
 
 import fs from 'fs'
 import globalModule from 'global'
+import {
+  normPath, parentOf, shellQuote, shellWriteCmds,
+} from './persist.js'
 
 const G = new globalModule.Global()
+
+// ==========================================================================
+// 写通道：探针 + 双通道（fs 优先，shell base64 兜底）+ 写后读回
+// --------------------------------------------------------------------------
+// 平台事实（逐固件不同，必须探针）：
+//  · 有的 4.x 固件根本没有 fs.writeFile —— 调用即 TypeError；
+//  · 有的存在但「返回成功却不落盘」；
+//  · 枚举 fs 的属性没用（Proxy 不可枚举）。
+// 唯一判据是「真写一次 + 读回比对」。
+// 这条链路不只影响配置：下载用的 shell 脚本也走同一条写通道，
+// 写不下去时 setsid sh 会静默什么都不做 → 最终表现成「网络请求超时/连接异常」。
+// ==========================================================================
+
+let writeChannel = 'unknown'   // 'fs' | 'shell' | 'none'
+let fsWriteErr = ''
+let shWriteFail = ''
+const dirsEnsured = {}
+
+export function writeDiag() {
+  return { channel: writeChannel, fsErr: fsWriteErr, shFail: shWriteFail }
+}
+
+function sh(cmd) {
+  try { return G.execShell(cmd) } catch (e) { return false }
+}
+
+// fs.readFile 是异步的；null = 读不到（区别于读到空文件）
+export async function readFileOrNull(path) {
+  try {
+    const t = await fs.readFile(path)
+    return t === null || t === undefined ? '' : String(t)
+  } catch (e) { return null }
+}
+
+// 关键读要给足重试：冷启动那一瞬间文件常常「还没就绪」，
+// 读不到就回退旧镜像 = 重启后配置倒退。
+export async function readFileRetry(path, times, gap) {
+  const n = Number(times) || 3
+  const g = Number(gap) || 150
+  for (let i = 0; i < n; i += 1) {
+    const t = await readFileOrNull(path)
+    if (t !== null) return t
+    await new Promise((resolve) => setTimeout(resolve, g))
+  }
+  return null
+}
+
+function ensureDirCached(dir) {
+  const d = normPath(dir)
+  if (!d || d === '/' || dirsEnsured[d]) return
+  sh('mkdir -p ' + shellQuote(d) + ' 2>/dev/null')
+  dirsEnsured[d] = 1
+}
+
+// shell 通道写：每段 6000 字符（4 的倍数 → 边界一定落在 3 字节整数倍上）
+function shWriteFile(path, body) {
+  const cmds = shellWriteCmds(path, body, 6000)
+  let ok = true
+  for (let i = 0; i < cmds.length; i += 1) {
+    if (!sh(cmds[i])) { ok = false; break }
+  }
+  if (!ok && !shWriteFail) shWriteFail = String(body || '').length + 'B 分段写入返回失败'
+  return ok
+}
+
+// 同步写：调用方（启动脚本、转码脚本）不能 await，所以做成同步的。
+// 通道由探针决定；探针还没跑过时先试 fs，抛错立刻切 shell。
+export function writeFileSync(path, data) {
+  const p = normPath(path)
+  const body = data == null ? '' : String(data)
+  ensureDirCached(parentOf(p))
+  if (writeChannel === 'shell' || writeChannel === 'none') return shWriteFile(p, body)
+  try {
+    fs.writeFile(p, body)
+    return true
+  } catch (e) {
+    if (!fsWriteErr) {
+      fsWriteErr = String((e && e.message) || e).slice(0, 120)
+    }
+    writeChannel = 'shell'
+    console.warn('[RP] fs.writeFile 不可用 -> shell 通道：' + fsWriteErr)
+    return shWriteFile(p, body)
+  }
+}
+
+// 串行队列：同一个文件不允许并发写 + 校验，否则校验永远在比别人的内容
+let writeChain = Promise.resolve()
+function serial(fn) {
+  const run = writeChain.then(fn, fn)
+  writeChain = run.then(() => null, () => null)
+  return run
+}
+
+// 写 + 读回比对（关键数据专用）
+export function writeFileVerified(path, data) {
+  const p = normPath(path)
+  const want = data == null ? '' : String(data)
+  return serial(async () => {
+    if (!writeFileSync(p, want)) return { ok: false, why: '写入命令失败' }
+    const got = await readFileRetry(p, 4, 150)
+    if (got === null) return { ok: false, why: '写后读不到' }
+    if (got === want) return { ok: true, why: '' }
+    return { ok: false, why: '读回不一致(' + want.length + '/' + got.length + ')' }
+  })
+}
+
+// 开工探针：只写一个小文件并读回。结果决定后续所有写入走哪条通道。
+let probePromise = null
+export function probeWrite() {
+  if (probePromise) return probePromise
+  probePromise = (async () => {
+    const p = '/tmp/rp_probe_w.txt'
+    const want = 'rp-probe-' + Date.now()
+    // 诊断开关：/userdisk/randompic_force_shell 存在时强制走 shell 通道。
+    // 用途：在「怀疑这台机器的 fs.writeFile 不可信」时一键自证（不用改代码重打包）。
+    let forceShell = false
+    try {
+      sh('rm -f /tmp/rp_fs_flag.txt; [ -f /userdisk/randompic_force_shell ] && echo 1 > /tmp/rp_fs_flag.txt')
+      forceShell = trim(await readFileRetry('/tmp/rp_fs_flag.txt', 2, 100)) === '1'
+    } catch (e) { forceShell = false }
+    if (forceShell) {
+      fsWriteErr = '被 force_shell 开关强制跳过'
+      console.warn('[RP] force shell channel by /userdisk/randompic_force_shell')
+    }
+    const hasWrite = !forceShell && typeof fs.writeFile === 'function'
+    if (hasWrite) {
+      try {
+        fs.writeFile(p, want)
+        const got = await readFileRetry(p, 3, 120)
+        if (got === want) {
+          writeChannel = 'fs'
+        } else if (!fsWriteErr) {
+          fsWriteErr = got === null ? '写入后读不到' : '写入内容不一致'
+        }
+      } catch (e) {
+        fsWriteErr = String((e && e.message) || e).slice(0, 120)
+      }
+    } else if (!forceShell) {
+      fsWriteErr = '该固件没有 fs.writeFile'
+    }
+    if (writeChannel !== 'fs') {
+      const ok = shWriteFile('/tmp/rp_probe_s.txt', want)
+      writeChannel = ok ? 'shell' : 'none'
+    }
+    console.warn('[RP] write channel=' + writeChannel +
+      (fsWriteErr ? ' fsErr=' + fsWriteErr : '') +
+      (shWriteFail ? ' shFail=' + shWriteFail : ''))
+    return writeDiag()
+  })()
+  return probePromise
+}
 
 // ---- 常量 ----
 // 保存目录：Picture / Favorite 都是系统本来就有的根目录，**不能重复创建**。
@@ -16,13 +170,13 @@ const PICTURE_ROOTS = ['/userdisk/Picture', '/userdisk/Pictures', '/userdisk/pic
 const FAVORITE_ROOTS = ['/userdisk/Favorite', '/userdisk/favorite']
 const SAVE_SUBDIR = 'randompic'
 
-// 目录是否存在。沿用本文件的「写标记文件再读回」模式：execShell 的返回值不可靠
-export function dirExists(path) {
+// 目录是否存在。沿用本文件的「写标记文件再读回」模式：execShell 的返回值不可靠，
+// 而且标记文件刚写完可能还读不到 —— 用重试而不是固定 sleep 猜。
+export async function dirExists(path) {
   const mark = '/tmp/rp_direxist.txt'
   execShell('rm -f ' + mark + '; [ -d ' + sq(path) + ' ] && echo yes > ' + mark)
-  return new Promise((resolve) => {
-    setTimeout(async () => resolve(trim(await readFile(mark)) === 'yes'), 250)
-  })
+  const v = await readFileRetry(mark, 3, 120)
+  return trim(v) === 'yes'
 }
 
 const ROOT_CACHE = {}
@@ -68,10 +222,43 @@ export function getDataDir() {
   try { return $dataDir } catch (e) { return '/tmp/' }
 }
 
-// 配置文件落盘位置（storage 不可靠时的兜底）
-const CFG_FILE = '/userdisk/randompic_cfg.json'
+// ---- 配置持久化 ----
+// 落盘文件是唯一的权威来源；jsapi storage 只做镜像（本机见过写进去读不回来）。
+//
+// 旧实现有三个会把配置「越存越少」的坑，全部修掉：
+//  1) saveConfig 用同步思维调 fs.readFile（其实是异步）→ JSON.parse(Promise) 必然抛错
+//     → 每次保存都从空对象开始 → 整个文件只剩最后写入的那个键。
+//     实测笔上 /userdisk/randompic_cfg.json 只剩 {"save_dir":"picture"}，其它源配置全没了。
+//  2) 写失败被 catch 掉 → 界面显示已保存，重启全丢。
+//  3) 原地覆盖写，写一半掉电/被杀 → JSON 损坏，所有设置一次清零。
+// 现在：内存快照 + 整份重写 + 先写 .tmp 再原子 mv + 写后读回比对，失败一路冒到界面。
+// 文件名带 appid：同一台设备上装了两个版本（完整版 / 和谐版）时，
+// 共用一个路径会让后装的那个读到前一个的设置 —— 实测和谐版一启动就显示
+// 完整版选的「小图」，源列表却只有两个，状态是矛盾的。
+const APPID_TAG = (function () {
+  try { return String($appid || '').replace(/[^0-9a-zA-Z]/g, '') } catch (e) { return '' }
+})()
+const CFG_BASE = '/userdisk/randompic_cfg' + (APPID_TAG ? '_' + APPID_TAG : '') + '.json'
+const CFG_FILE = CFG_BASE
+const CFG_TMP = CFG_BASE + '.tmp'
 
-// ---- storage：jsapi 优先，fs 兜底 ----
+let cfgAll = null          // 内存快照（只存已加载/已写入的键）
+let cfgFileCorrupt = false // 读到的文件解析不了（旧版本写坏的）
+let lastCfgSave = { ok: true, why: '' }
+
+export function cfgDiag() {
+  const d = writeDiag()
+  return {
+    file: CFG_FILE,
+    corrupt: cfgFileCorrupt,
+    keys: cfgAll ? Object.keys(cfgAll) : [],
+    lastSave: lastCfgSave.ok ? 'ok' : lastCfgSave.why,
+    channel: d.channel,
+    fsErr: d.fsErr,
+  }
+}
+
+// ---- storage（镜像，仅作辅助）----
 export function storageSet(key, data) {
   try {
     if ($falcon && $falcon.jsapi && $falcon.jsapi.storage) {
@@ -92,48 +279,110 @@ export function storageGet(key) {
   return null
 }
 
-// ---- 配置持久化：storage + fs 双写双读 ----
-export async function loadConfig(key, fallback) {
-  const v = storageGet(key)
-  if (v !== null && v !== undefined) {
-    try { return JSON.parse(v) } catch (e) { return fallback }
-  }
-  // fs 兜底（readFile 异步）
+// 镜像也要读回校验：setStorage 返回正常不代表读得出来（已实测过这个分支）
+function storageVerified(key, value) {
+  const want = JSON.stringify(value)
+  if (!storageSet(key, want)) return false
+  const got = storageGet(key)
+  if (got === null || got === undefined) return false
   try {
-    const txt = await fs.readFile(CFG_FILE)
-    if (txt) {
-      const all = JSON.parse(txt)
-      if (all && all[key] !== undefined) return all[key]
+    const norm = typeof got === 'string' ? JSON.parse(got) : got
+    return JSON.stringify(norm) === want
+  } catch (e) { return false }
+}
+
+// 启动时整份读一次（6×250ms：冷启动那一瞬间文件常常还没就绪，
+// 读不到就回退镜像会让设置倒退）。文件里没有的键才用镜像补。
+export async function loadAllConfig(keys) {
+  const txt = await readFileRetry(CFG_FILE, 6, 250)
+  const all = {}
+  if (txt !== null && txt !== '') {
+    try {
+      const o = JSON.parse(txt)
+      if (o && typeof o === 'object' && !Array.isArray(o)) {
+        for (const k of Object.keys(o)) all[k] = o[k]
+      } else {
+        cfgFileCorrupt = true
+      }
+    } catch (e) {
+      // 旧版本留下的坏文件：保留现场不动，改用镜像/默认值，等下一次保存再覆盖
+      cfgFileCorrupt = true
+      console.warn('[RP] cfg 文件损坏，本次以镜像为准：' + String(e && e.message || e).slice(0, 80))
     }
-  } catch (e) { /* ignore */ }
+  }
+  let fromMirror = 0
+  for (const k of keys || []) {
+    if (all[k] !== undefined) continue
+    const v = storageGet(k)
+    if (v === null || v === undefined) continue
+    try { all[k] = JSON.parse(v); fromMirror += 1 } catch (e) { /* ignore */ }
+  }
+  cfgAll = all
+  console.warn('[RP] cfg load keys=' + Object.keys(all).length +
+    ' mirror=' + fromMirror + ' corrupt=' + (cfgFileCorrupt ? 1 : 0) +
+    ' file=' + (txt === null ? 'unreadable' : txt.length + 'B'))
+  return all
+}
+
+// 兼容旧调用：单键读取（优先整份快照）
+export async function loadConfig(key, fallback) {
+  if (!cfgAll) await loadAllConfig([key])
+  if (cfgAll && cfgAll[key] !== undefined) return cfgAll[key]
   return fallback
 }
 
+// 写整份配置：.tmp → mv 原子替换 → 读回比对
+function writeCfgFile(text) {
+  if (!writeFileSync(CFG_TMP, text)) return { ok: false, why: '写入命令失败' }
+  // 同目录 rename 是原子的：要么旧文件完整，要么新文件完整，不存在「写了一半」
+  const moved = execShell('mv -f ' + shellQuote(CFG_TMP) + ' ' + shellQuote(CFG_FILE))
+  if (!moved) {
+    // mv 不可用时退回直接写（至少不会丢已有配置）
+    if (!writeFileSync(CFG_FILE, text)) return { ok: false, why: 'mv/写入均失败' }
+  }
+  return readFileRetry(CFG_FILE, 4, 150).then((got) => {
+    if (got === null) return { ok: false, why: '写后读不到' }
+    if (got === text) return { ok: true, why: '' }
+    return { ok: false, why: '读回不一致(' + text.length + '/' + got.length + ')' }
+  })
+}
+
+// 保存一项配置。返回 Promise<{ok, why}>：调用方必须把 false 冒到界面上。
 export function saveConfig(key, value) {
-  storageSet(key, JSON.stringify(value))
-  // fs 兜底写（writeFile 同步）
-  try {
-    let all = {}
-    try { all = JSON.parse(fs.readFile(CFG_FILE) || '{}') } catch (e) { all = {} }
-    all[key] = value
-    fs.writeFile(CFG_FILE, JSON.stringify(all))
-  } catch (e) { /* ignore */ }
+  if (!cfgAll) cfgAll = {}
+  cfgAll[key] = value
+  const text = JSON.stringify(cfgAll)
+  const mirrorOk = storageVerified(key, value)
+  return serial(() => writeCfgFile(text)).then((r) => {
+    const res = r.ok ? r : { ok: false, why: mirrorOk ? '' : (r.why || '写入失败') }
+    // 镜像能读回时至少说明「本次会话内不会丢」，但仍要如实告诉调用方文件没写成
+    lastCfgSave = { ok: r.ok, why: r.ok ? '' : (mirrorOk ? '文件未写入' : (r.why || '写入失败')) }
+    if (!r.ok) {
+      console.warn('[RP] cfg save FAIL key=' + key + ' why=' + lastCfgSave.why +
+        ' mirror=' + (mirrorOk ? 'ok' : 'fail') + ' diag=' + JSON.stringify(writeDiag()))
+    }
+    return res
+  })
 }
 
-// ---- 文件写（同步）----
-export function writeFileSync(path, data) {
-  try { fs.writeFile(path, data); return true } catch (e) { return false }
+// 等所有排队中的配置写入落地（页面销毁 / 退出前用）
+export function flushConfig() {
+  return writeChain
 }
 
-// ---- execShell + 读回 ----
+// ---- execShell ----
+// 注意：这是同步阻塞调用，命令跑多久就卡多久主线程；
+// 长任务必须走下面的 launch() 后台化。
 export function execShell(cmd) {
   try { return G.execShell(cmd) } catch (e) { return false }
 }
 
-// fs.readFile 是异步的，必须 await
+// 兼容旧调用：读不到返回 ''（需要区分「读不到」与「空文件」时用 readFileOrNull）
 export async function readFile(path) {
-  try { return await fs.readFile(path) } catch (e) { return '' }
+  const t = await readFileOrNull(path)
+  return t === null ? '' : t
 }
+
 
 // ---- 输入法 ----
 let curUuid = null
@@ -193,13 +442,20 @@ function sq(s) {
 }
 
 // 点火：后台执行脚本，立即返回。args 会作为位置参数传给脚本。
+// 返回 false = 脚本没写下去（写通道坏了）。此时 setsid sh 会静默什么都不做，
+// 调用方若还傻等完成标记，最终只会超时并报成「网络异常」—— 所以必须在这里拦住。
 function launch(scriptPath, scriptBody, args) {
-  writeFileSync(scriptPath, scriptBody)
+  if (!writeFileSync(scriptPath, scriptBody)) {
+    console.warn('[RP] launch write-fail ' + scriptPath + ' diag=' + JSON.stringify(writeDiag()))
+    return false
+  }
   const cmd =
     'chmod 755 ' + sq(scriptPath) + '; ' +
     'setsid sh ' + sq(scriptPath) + ' ' + args.join(' ') +
     ' </dev/null >/dev/null 2>&1 &'
-  execShell(cmd)
+  const ok = execShell(cmd)
+  if (!ok) console.warn('[RP] launch exec-fail ' + scriptPath)
+  return !!ok
 }
 
 // 去掉首尾空白
@@ -208,7 +464,7 @@ function trim(s) {
 }
 
 // ---- HTTP：curl 拿 JSON ----
-// 返回 { code, body, size }；失败 code 为 '000'
+// 返回 { code, body, size }；失败 code 为 '000'；本地写不了脚本时 code 为 'write-fail'
 export function curlGetJson(url, timeoutMs) {
   const tm = timeoutMs || 20
   const key = nextTaskKey()
@@ -225,7 +481,11 @@ export function curlGetJson(url, timeoutMs) {
   ].join('\n')
 
   console.warn('[RP] fetch url=' + url)
-  launch('/tmp/rp_json.sh', script, [sq(url), sq(String(tm)), sq(bodyFile), sq(resFile), sq(doneFile)])
+  const started = launch('/tmp/rp_json.sh', script, [sq(url), sq(String(tm)), sq(bodyFile), sq(resFile), sq(doneFile)])
+  if (!started) {
+    // 立刻返回，别让用户对着「请求中」等 28 秒再看到一句「请检查网络」
+    return Promise.resolve({ code: 'write-fail', size: 0, body: '' })
+  }
 
   const maxWait = tm * 1000 + 8000
   return new Promise((resolve) => {
@@ -371,13 +631,25 @@ export async function downloadImageNative(url, dir, name, timeoutMs, key) {
     }
   }
 
-  writeFileSync(scriptFile, CONV_SCRIPT)
+  if (!writeFileSync(scriptFile, CONV_SCRIPT)) {
+    // 转码脚本写不下去：别再往下走（否则 res 永远为空，又被当成解码失败）
+    const finalNameW = String(name).replace(/\.\w+$/, '') + '.jpg'
+    return {
+      ok: false,
+      relName: finalNameW,
+      path: String(dir).replace(/\/+$/, '') + '/' + finalNameW,
+      size: 0,
+      reason: 'write-fail',
+    }
+  }
   try {
     execShell('rm -f ' + resFile + '; sh ' + scriptFile + ' ' +
       sq(picked) + ' ' + sq(dir) + ' ' + sq(name) + ' ' + sq(resFile))
   } catch (e) { /* ignore */ }
 
-  const res = trim(await readFile(resFile))
+  // execShell 是同步的，命令返回时结果文件已写好；仍给两次重试吸收 fs 缓存延迟
+  const res = trim(await readFileRetry(resFile, 2, 120))
+
   const ok = /^ok\s/.test(res)
   const ms = /^ok\s+\d+\s+(\d+)/.exec(res)
   // 清掉临时下载文件（缓存目录会越来越大）
@@ -539,13 +811,20 @@ export function downloadImage(url, dir, name, timeoutMs, onProgress) {
 
   console.warn('[RP] dl ' + url + ' -> ' + finalPath)
   const tL0 = Date.now()
-  launch('/tmp/rp_img.sh', IMG_SCRIPT, [
+  const started = launch('/tmp/rp_img.sh', IMG_SCRIPT, [
     sq(url), sq(d), sq(n), sq(String(tm)),
     sq(resFile), sq(doneFile), sq(progFile),
   ])
   // 计时埋点：execShell 本身在这台设备上可能很慢（曾见 CpuProf 记录 25s），
   // 打出来才能分清「启动慢」还是「下载慢」
   console.warn('[RP] launched in ' + (Date.now() - tL0) + 'ms')
+  if (!started) {
+    // 脚本没落地时后台什么都不会发生，等下去只会得到一句「timeout」，
+    // 再被上层当成网络问题。直接给出真实原因。
+    return Promise.resolve({
+      ok: false, relName: n, path: finalPath, size: 0, reason: 'write-fail',
+    })
+  }
 
   // 两次尝试 + 每次 tm 秒，留足余量（并发探测/回退会多花几秒）
   const maxWait = tm * 2 * 1000 + 60000
@@ -655,7 +934,14 @@ export async function fetchImage(url, dir, name, opts) {
         .map((s) => sq(dirN + '/' + base + s)).join(' ')
       execShell('rm -f ' + junk)
     } catch (e) { /* ignore */ }
-    return { ok: true, relName: finalName, path: dirN + '/' + finalName, size: winner.size || 0, reason: '' }
+    // 发布后必须落到最终名上：mv 失败（或对冲那路的文件已被清掉）时，
+    // 上层会以为成功、<image> 却拿到一个不存在的 src —— 用户看到的是「空白 + 已获取」。
+    const fin = await fileSize(dirN + '/' + finalName)
+    if (fin <= 0) {
+      console.warn('[RP] publish-fail ' + finalName + ' size=' + fin)
+      return { ok: false, relName: finalName, path: dirN + '/' + finalName, size: 0, reason: 'publish-fail' }
+    }
+    return { ok: true, relName: finalName, path: dirN + '/' + finalName, size: fin, reason: '' }
   }
 
   // 都失败时把「更能说明问题」的原因带回去：
@@ -714,31 +1000,37 @@ export function ensureDir(path) {
   execShell("mkdir -p " + sq(path))
 }
 
+// 文件字节数（<0 表示读不到）
+export function fileSize(path) {
+  const out = '/tmp/rp_size.txt'
+  execShell('[ -f ' + sq(path) + ' ] && stat -c %s ' + sq(path) + ' > ' + out + ' || echo -1 > ' + out)
+  return readFileRetry(out, 3, 120).then((t) => {
+    const v = trim(t)
+    return v === '' ? -1 : Number(v)
+  })
+}
+
 // 取文件 md5 前 12 位（用来判「这次下到的图是不是和上次一模一样」）
 // 为什么要按内容判而不是按 URL：icatw 的接口会一直返回同一个 id / 同一个 URL，
 // 但代理每次给的字节其实不同；只看 URL 会误判成「重复」，只看 URL 相等也会漏判。
 export function fileMd5(path) {
   const out = '/tmp/rp_md5.txt'
-  execShell("md5sum " + sq(path) + " 2>/dev/null | cut -c1-12 > " + out)
-  return new Promise((resolve) => {
-    setTimeout(async () => {
-      resolve(trim(await readFile(out)))
-    }, 400)
-  })
+  execShell('rm -f ' + out + '; md5sum ' + sq(path) + ' 2>/dev/null | cut -c1-12 > ' + out)
+  return readFileRetry(out, 3, 120).then((t) => trim(t))
 }
 
-// 复制文件（cp），返回是否成功
+// 复制文件（cp）。判据是「目标文件真的有内容」，不是「cp 命令发出去了」：
+// 旧实现只等固定 2.5s 再读一个标记，目标没写出来也照样返回 ok。
 export function copyFile(src, dest) {
   const markFile = '/tmp/rp_cp.txt'
   const cmd =
-    "rm -f " + markFile + "; " +
-    "cp " + sq(src) + " " + sq(dest) + "; " +
-    "if [ -s " + sq(dest) + " ]; then echo ok > " + markFile + "; fi"
+    'rm -f ' + markFile + '; ' +
+    'cp ' + sq(src) + ' ' + sq(dest) + '; ' +
+    'if [ -s ' + sq(dest) + ' ]; then stat -c %s ' + sq(dest) + ' > ' + markFile + '; fi'
   execShell(cmd)
-  return new Promise((resolve) => {
-    setTimeout(async () => {
-      const mark = trim(await readFile(markFile))
-      resolve(mark === 'ok')
-    }, 2500)
+  return readFileRetry(markFile, 10, 200).then((t) => {
+    const n = Number(trim(t))
+    return !!n && n > 0
   })
 }
+

@@ -150,7 +150,7 @@ import {
   proxyResizeUrl, mixR18,
 } from '@/lib/config.js'
 import {
-  loadConfig, saveConfig, openInput, registerTextEdit,
+  loadAllConfig, saveConfig, openInput, registerTextEdit, probeWrite, writeDiag,
   curlGetJson, fetchImage as fetchImageFile, copyFile, getWorkspace,
   pruneImages, fileMd5, resolveSaveRoot, sweepTemp,
 } from '@/lib/native.js'
@@ -270,17 +270,13 @@ export default {
   },
 
   created() {
-    registerTextEdit()
-    // 启动即清理上一轮遗留：临时文件全删，上一轮缓存的图只留最近 2 张
-    // （不点「保存」的图都只是临时缓存，不该长期占着包目录）
-    try {
-      sweepTemp(getWorkspace())
-      pruneImages(getWorkspace(), 2)
-    } catch (e) { /* 清理失败不影响主流程 */ }
-    // 读回持久化配置（异步）
-    this.loadAll().then(() => {
-      this.applySource(this.curSource)
-    })
+    this.bootOnce()
+  },
+
+  // 平台差异：某些固件只回调 onShow/onHide/onUnload，不调 created。
+  // 初始化做成「谁先到谁执行、只跑一次」，两边都挂上，缺哪个都不影响。
+  onShow() {
+    this.bootOnce()
   },
 
   beforeDestroy() {
@@ -289,22 +285,71 @@ export default {
   },
 
   methods: {
+    // ---- 启动：探针 → 清理 → 读配置 ----
+    bootOnce() {
+      if (this._booted) return
+      this._booted = true
+
+      registerTextEdit()
+
+      // 启动即清理上一轮遗留：临时文件全删，上一轮缓存的图只留最近 2 张
+      // （不点「保存」的图都只是临时缓存，不该长期占着包目录）
+      try {
+        sweepTemp(getWorkspace())
+        pruneImages(getWorkspace(), 2)
+      } catch (e) { /* 清理失败不影响主流程 */ }
+
+      // 先探一次写通道：这台固件到底能不能 fs.writeFile。
+      // 不先探就写，遇到没有 writeFile 的固件会表现为「配置不保存 + 下载一直超时」。
+      this._bootPromise = probeWrite().then(() => {
+        const d = writeDiag()
+        if (d.channel === 'none') {
+          this.status = '本地存储不可写，配置无法保存'
+        }
+        return this.loadAll()
+      }).then(() => {
+        this.applySource(this.curSource)
+      }).catch((e) => {
+        console.warn('[RP] boot fail ' + (e && e.message ? e.message : e))
+        this.applySource(this.curSource)
+      })
+    },
+
     // ---- 配置加载/保存 ----
     async loadAll() {
+      const keys = []
+      for (const sid of SOURCE_IDS) keys.push('cfg_' + sid)
+      keys.push('save_dir')
+      const all = await loadAllConfig(keys)
+
       const map = {}
       for (const sid of SOURCE_IDS) {
-        map[sid] = sanitizeConfig(sid, await loadConfig('cfg_' + sid, defaultConfig(sid)))
+        map[sid] = sanitizeConfig(sid, all['cfg_' + sid] || defaultConfig(sid))
       }
-      const savedDir = await loadConfig('save_dir', 'picture')
       this.cfgMap = map
+      const savedDir = all['save_dir']
       this.saveDir = savedDir === 'favorite' ? 'favorite' : 'picture'
     },
 
-    persist() {
-      for (const sid of SOURCE_IDS) {
-        saveConfig('cfg_' + sid, this.cfgMap[sid])
+    // 保存全部配置：整份重写（不是「读一遍再补一个键」），并等结果。
+    // 失败必须冒到状态栏 —— 静默失败会让用户以为设置已经记住了。
+    async persist() {
+      // 配置读盘是异步的；万一用户在读完之前就点了选项，
+      // 这里先等它落地，否则会拿一份空快照覆盖磁盘上的其它键。
+      if (this._bootPromise) { try { await this._bootPromise } catch (e) { /* ignore */ } }
+      let bad = ''
+      const list = []
+      for (const sid of SOURCE_IDS) list.push(['cfg_' + sid, this.cfgMap[sid]])
+      list.push(['save_dir', this.saveDir])
+      for (const item of list) {
+        const r = await saveConfig(item[0], item[1])
+        if (!r || !r.ok) bad = (r && r.why) || '写入失败'
       }
-      saveConfig('save_dir', this.saveDir)
+      if (bad) {
+        this.status = '配置未保存：' + bad
+        console.warn('[RP] cfg persist fail ' + bad)
+      }
+      return !bad
     },
 
     applySource(sid) {
@@ -407,6 +452,15 @@ export default {
           this.status = '下载图片...'
         } else {
           const r = await curlGetJson(url, 20)
+          if (r.code === 'write-fail') {
+            // 本地写不了脚本 → 后台任务根本没起来。这跟「网络不通」是两件事，
+            // 旧版本会把它显示成「请检查网络」，把排查方向带偏。
+            this.busy = false
+            this.loading = false
+            this.status = '本地存储不可写（脚本未落地）'
+            this.imgHint = '请在设置里检查存储权限/空间，或重启应用'
+            return
+          }
           if (r.code !== '200') {
             this.busy = false
             this.loading = false
@@ -751,11 +805,14 @@ export default {
 
       // 优先：已有本地临时文件，直接复制；否则重新下载
       if (this.localImgPath) {
-        const copyOk = copyFile(this.localImgPath, dest)
+        // copyFile 返回 Promise —— 旧代码忘了 await，判断恒为真，
+        // 于是复制失败也立刻显示「已保存到 xxx」，用户去相册里找不到图。
+        const copyOk = await copyFile(this.localImgPath, dest)
         if (copyOk) {
           this.status = '已保存到 ' + dest
           return
         }
+        console.warn('[RP] copy fail ' + this.localImgPath + ' -> ' + dest)
       }
       // 走到这里说明本地缓存文件没复制成功（被 prune 清掉了），只能重新下一次
       const pace = pacedStatus(this, '下载中')

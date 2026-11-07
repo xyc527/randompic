@@ -142,7 +142,7 @@ if (!targets.length) {
   }
 }
 
-const left = adbFor(['shell', 'ls -1 ' + REMOTE_DIR + '/8001793430496590*.amr 2>/dev/null'])
+const left = adbFor(['shell', 'ls -1 ' + REMOTE_DIR + '/' + APPID + '*.amr 2>/dev/null'])
   .split('\n').map((s) => s.trim()).filter(Boolean)
 log('== 留在设备上的本应用包: ' + left.join(', '))
 
