@@ -1,0 +1,44 @@
+{
+  "name": "randompic",
+  "appid": "8001793430496590",
+  "appName": "随机图片",
+  "icon": "app_icon.png",
+  "version": "1.3.9",
+  "description": "多源随机图片小程序：可切换 Pixiv Yuki / Anime Gateway / 雪涼 Setu 图源，支持尺寸分级与本地保存",
+  "quickjs": {
+    "version": "20200705",
+    "bigNum": false
+  },
+  "simulator": {
+    "path": "",
+    "page": ""
+  },
+  "single-js-bundle": false,
+  "scripts": {
+    "start": "aiot-cli preview",
+    "build": "aiot-cli -p",
+    "build:dev": "aiot-cli",
+    "build:bin": "aiot-cli -q -p",
+    "build:prod": "aiot-cli -c -q -p",
+    "build:bin-nopack": "aiot-cli -q",
+    "build:web": "aiot-cli build-web",
+    "build:simulator": "aiot-cli simulator ./",
+    "upload": "aiot-cli upload -n",
+    "check": "aiot-cli check",
+    "check:beta": "aiot-cli check -b",
+    "postbuild:prod": "node tools/push-amr.mjs",
+    "push": "node tools/push-amr.mjs",
+    "push:install": "node tools/push-amr.mjs --install",
+    "push:dry": "node tools/push-amr.mjs --dry-run"
+  },
+  "keywords": [
+    "iot",
+    "miniapp"
+  ],
+  "devDependencies": {
+    "aiot-vue-cli": "^1.0.32"
+  },
+  "dependencies": {
+    "falcon-ui": "^2.0.2"
+  }
+}
