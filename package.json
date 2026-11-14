@@ -3,7 +3,7 @@
   "appid": "8001793430496590",
   "appName": "随机图片",
   "icon": "app_icon.png",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "description": "多源随机图片小程序：可切换 Pixiv Yuki / Anime Gateway / 雪涼 Setu 图源，支持尺寸分级与本地保存",
   "quickjs": {
     "version": "20200705",

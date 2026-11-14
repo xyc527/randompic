@@ -1,5 +1,5 @@
 <template>
-  <div class="root">
+  <div class="root" :style="rootStyle">
     <!-- 顶栏：标题 + 源切换 -->
     <div class="topbar">
       <text class="title">随机图片</text>
@@ -20,7 +20,7 @@
     <div class="body">
       <!-- 左栏：图片显示 -->
       <div class="left">
-        <div class="img-box" @click="openFullscreen">
+        <div class="img-box" :style="imgBoxStyle" @click="openFullscreen">
           <!-- 源说明（如 setu 缺 API Key）优先于通用占位文案 -->
           <div v-if="!imgUrl && noticeLines.length" class="img-notice">
             <text
@@ -41,6 +41,7 @@
             v-if="imgUrl"
             :key="imgUrl"
             class="img"
+            :style="imgBoxStyle"
             :src="imgUrl"
             resize="contain"
             @load="onImgLoad"
@@ -52,7 +53,7 @@
 
       <!-- 右栏：字段配置 + 操作 -->
       <div class="right">
-        <scroller class="fields" scroll-direction="vertical">
+        <scroller class="fields" :style="fieldsStyle" scroll-direction="vertical">
           <div
             v-for="f in fields"
             :key="f.key"
@@ -97,7 +98,7 @@
     </div>
 
     <!-- 全屏大图覆盖层：点击图片放大，点空白处返回；可继续放大/缩小（最大 8 倍）并拖动查看 -->
-    <div v-if="fullscreen" class="fullscreen-layer">
+    <div v-if="fullscreen" class="fullscreen-layer" :style="fsLayerStyle">
       <!-- 工具条单独一层：点这里不触发「点任意处返回」 -->
       <div class="fs-bar">
         <text class="fs-zoom-text">缩放 {{ fsZoomText }}</text>
@@ -117,7 +118,7 @@
         </div>
       </div>
       <!-- 舞台：拖动移动画面，轻点空白处返回 -->
-      <div class="fs-stage" @click="onStageClick">
+      <div class="fs-stage" :style="fsStageStyle" @click="onStageClick">
         <div
           class="fs-canvas"
           :style="fsCanvasStyle"
@@ -132,6 +133,7 @@
             v-if="imgUrl"
             :key="'fs_' + imgUrl"
             class="fullscreen-img"
+            :style="fsStageStyle"
             :src="imgUrl"
             resize="contain"
           />
@@ -154,6 +156,7 @@ import {
   curlGetJson, fetchImage as fetchImageFile, copyFile, getWorkspace,
   pruneImages, fileMd5, resolveSaveRoot, sweepTemp,
 } from '@/lib/native.js'
+import { layout as fitLayout } from '@/lib/fit.js'
 
 // 原生下载没有进度回调，长时间没反应时界面会像卡死。
 // 用秒数计时先给点反馈；一旦 curl 通道开始报 KB 进度，就让它接管。
@@ -175,8 +178,8 @@ function pacedStatus(view, label) {
 // 档位固定成等差数列，避免连续乘 1.5 出现 150% / 225% 这种难读的数字。
 const ZOOM_STEPS = [1, 1.25, 1.5, 2, 2.5, 3, 4, 6, 8]
 const ZOOM_MAX = 8
-const FS_W = 936
-const FS_H = 244
+// 全屏舞台等骨架尺寸不再写死：启动时由 fit.js 的 layout() 按真实屏幕算出（见 data.lay），
+// 设计尺寸的机器（936×280）算出来与设计稿完全相等。
 
 // 触摸点坐标：Weex 的 touch 事件挂在 changedTouches/touches[0] 上，字段是 pageX/pageY
 function touchPoint(e) {
@@ -231,6 +234,9 @@ export default {
       fsTimer: null,
       fsDrag: null,
       fsSuppress: false,
+      // 整屏骨架尺寸：设计稿 936×280 起步，启动时按真实屏幕重算（见 lib/fit.js）。
+      // 模板里所有"跟屏幕有关"的宽高都从这里取，类名不再写死尺寸。
+      lay: fitLayout(null),
       // 输入法当前编辑的字段
       editingKey: '',
     }
@@ -257,15 +263,33 @@ export default {
     fsCanOut() {
       return this.fsScale > 1.001
     },
-    // 用 transform 缩放：容器布局尺寸不变（仍是 936×244），视觉上放大 8 倍也不会把页面撑开，
+    // 用 transform 缩放：容器布局尺寸不变（舞台多大就多大），视觉上放大 8 倍也不会把页面撑开，
     // 超出部分由舞台的 overflow 裁掉。translate 写在 scale 前面 = 位移按屏幕像素算，符合拖动手感。
     fsCanvasStyle() {
       return {
-        width: FS_W + 'px',
-        height: FS_H + 'px',
+        width: this.lay.stageW + 'px',
+        height: this.lay.stageH + 'px',
         transform: 'translate(' + this.fsX + 'px, ' + this.fsY + 'px) scale(' + this.fsScale + ')',
         transformOrigin: 'center center',
       }
+    },
+
+    // ---- 骨架尺寸：全部内联注入 ----
+    // 类名里不再保留同名属性（Weex 下类名与内联同时设一个属性时优先级不可靠）。
+    rootStyle() {
+      return { width: this.lay.rootW + 'px', height: this.lay.rootH + 'px' }
+    },
+    imgBoxStyle() {
+      return { width: this.lay.imgW + 'px', height: this.lay.imgH + 'px' }
+    },
+    fieldsStyle() {
+      return { height: this.lay.fieldsH + 'px' }
+    },
+    fsLayerStyle() {
+      return { width: this.lay.rootW + 'px', height: this.lay.rootH + 'px' }
+    },
+    fsStageStyle() {
+      return { width: this.lay.stageW + 'px', height: this.lay.stageH + 'px' }
     },
   },
 
@@ -289,6 +313,13 @@ export default {
     bootOnce() {
       if (this._booted) return
       this._booted = true
+
+      // 整屏骨架按真实屏幕重算：936×280 上每个值都等于设计稿（零变化），
+      // 换机型（960×266 等）时按虚拟画布铺满，不再出现底部被裁。
+      try {
+        const fit = (typeof globalThis !== 'undefined' && globalThis['$rpFit']) || null
+        this.lay = fitLayout(fit)
+      } catch (e) {}
 
       registerTextEdit()
 
@@ -681,8 +712,8 @@ export default {
 
     // 位移边界：画面只能在自己的尺寸范围内移动，不会拖到全黑
     clampFs(scale, x, y) {
-      const mx = Math.max(0, (FS_W * scale - FS_W) / 2)
-      const my = Math.max(0, (FS_H * scale - FS_H) / 2)
+      const mx = Math.max(0, (this.lay.stageW * scale - this.lay.stageW) / 2)
+      const my = Math.max(0, (this.lay.stageH * scale - this.lay.stageH) / 2)
       return {
         x: Math.round(Math.min(mx, Math.max(-mx, x))),
         y: Math.round(Math.min(my, Math.max(-my, y))),
@@ -758,8 +789,11 @@ export default {
         this.fsDrag = { x: t.x, y: t.y, px: this.fsX, py: this.fsY }
         return
       }
-      const dx = t.x - this.fsDrag.x
-      const dy = t.y - this.fsDrag.y
+      // 触摸事件给的是真实像素，位移先换算成设计 px（setViewPort 之后框架会再放大回去）。
+      // 设计尺寸的机器 factor = 1，与原逻辑完全一致。
+      const k = this.lay.factor > 0 ? this.lay.factor : 1
+      const dx = (t.x - this.fsDrag.x) / k
+      const dy = (t.y - this.fsDrag.y) / k
       if (!dx && !dy) return
       if (Math.abs(dx) > 2 || Math.abs(dy) > 2) this.fsSuppress = true
       this.fsDrag.x = t.x
@@ -832,15 +866,16 @@ export default {
 @import "base.less";
 
 .root {
-  width: 936px;
-  height: 280px;
+  /* 宽高由 :style 注入（lib/fit.js 按真实屏幕算出的虚拟画布），这里不再写死。
+     setViewPort 已把设计稿等比缩到屏幕，所以模板里的 px 就是设计 px。 */
   flex-direction: column;
   background-color: #f5f6f8;
 }
 
 /* 顶栏 */
 .topbar {
-  width: 936px;
+  /* 满宽：换宽屏机型时不能留一条背景色缝隙 */
+  width: 100%;
   height: 44px;
   flex-direction: row;
   align-items: center;
@@ -881,31 +916,27 @@ export default {
 
 /* 主体 */
 .body {
-  width: 936px;
-  height: 236px;
+  /* 宽度跟屏幕走，高度吃掉顶栏之外的全部；左右两栏靠 stretch 等高 */
+  width: 100%;
+  flex: 1;
   flex-direction: row;
+  align-items: stretch;
 }
 
 /* 左栏：图片 */
+/* 左栏：图片（吃掉右栏以外的全部宽度，比设计稿宽的屏上图片区跟着变宽） */
 .left {
-  width: 560px;
-  height: 236px;
+  flex: 1;
   flex-direction: column;
   padding: 8px;
 }
 
+/* 尺寸由 :style 注入：宽 = 屏幕 - 右栏，高 = 主体高 - 文字行 */
 .img-box {
-  width: 544px;
-  height: 190px;
   background-color: #e8eaed;
   border-radius: 8px;
   justify-content: center;
   align-items: center;
-}
-
-.img {
-  width: 544px;
-  height: 190px;
 }
 
 .img-notice {
@@ -945,14 +976,13 @@ export default {
 /* 右栏 */
 .right {
   width: 376px;
-  height: 236px;
   flex-direction: column;
   padding: 8px;
 }
 
+/* 高度由 :style 注入：屏幕更高时字段区跟着长，按钮不会被挤出屏幕 */
 .fields {
   width: 360px;
-  height: 130px;
 }
 
 .field-row {
@@ -1054,9 +1084,8 @@ export default {
 }
 
 /* 全屏大图覆盖层 */
+/* 全屏大图覆盖层：宽高由 :style 注入（= 整屏虚拟画布） */
 .fullscreen-layer {
-  width: 936px;
-  height: 280px;
   position: absolute;
   top: 0;
   left: 0;
@@ -1068,7 +1097,7 @@ export default {
 
 /* 缩放工具条：独立一层，点它不会触发「点舞台返回」 */
 .fs-bar {
-  width: 936px;
+  width: 100%;
   height: 36px;
   flex-direction: row;
   align-items: center;
@@ -1118,9 +1147,8 @@ export default {
 }
 
 /* 舞台：画面在这里被缩放/拖动，超出部分裁掉（容器默认 overflow 就是 hidden） */
+/* 舞台：画面在这里被缩放/拖动，超出部分裁掉。宽高由 :style 注入 */
 .fs-stage {
-  width: 936px;
-  height: 244px;
   justify-content: center;
   align-items: center;
   overflow: hidden;
@@ -1131,8 +1159,5 @@ export default {
   align-items: center;
 }
 
-.fullscreen-img {
-  width: 936px;
-  height: 244px;
-}
+
 </style>
